@@ -16,6 +16,11 @@
 
 import { Config } from '@backstage/config';
 import {
+  ScmIntegrations,
+  GithubIntegration,
+  GithubAppConfig,
+} from '@backstage/integration';
+import {
   RequestDetails,
   RequestValidationContext,
   RequestValidator,
@@ -36,7 +41,22 @@ import { verify } from '@octokit/webhooks-methods';
 export function createGithubSignatureValidator(
   config: Config,
 ): RequestValidator {
-  const secret = config.getString('events.modules.github.webhookSecret');
+  const { github } = ScmIntegrations.fromConfig(config);
+  const apps = github
+    .list()
+    .flatMap((i: GithubIntegration) => i.config.apps || []);
+  const secrets = apps.map((app: GithubAppConfig) => {
+    if (!app.webhookSecret) {
+      throw Error(
+        `Missing required config value 'webhookSecret' for GitHub app ${app.appId}`,
+      );
+    }
+    return app.webhookSecret!;
+  });
+
+  if (apps.length === 0 || config.has('events.modules.github.webhookSecret')) {
+    secrets.push(config.getString('events.modules.github.webhookSecret'));
+  }
 
   return async (
     request: RequestDetails,
@@ -46,14 +66,28 @@ export function createGithubSignatureValidator(
       | string
       | undefined;
 
-    if (
-      !signature ||
-      !(await verify(
-        secret,
-        request.raw.body.toString(request.raw.encoding),
-        signature,
-      ))
-    ) {
+    // Verify if we have a signature header
+    if (!signature) {
+      context.reject({
+        status: 403,
+        payload: { message: 'missing signature' },
+      });
+      return;
+    }
+
+    // Try to verify the signature using any of the configured secrets
+    const bodyString = request.raw.body.toString(request.raw.encoding);
+    const isValidSignature = await Promise.any(
+      secrets.map(async secret => {
+        if (!(await verify(secret, bodyString, signature))) {
+          throw new Error();
+        }
+        return true;
+      }),
+    ).catch(() => false);
+
+    // Reject if no valid signature was found
+    if (!isValidSignature) {
       context.reject({
         status: 403,
         payload: { message: 'invalid signature' },
